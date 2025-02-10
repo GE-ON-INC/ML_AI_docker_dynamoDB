@@ -1,146 +1,118 @@
-# ML_AI_docker_dynamoDB
-Project: ML_AI_Docker_DynamoDB
+# AI-Powered News Article Scraper
 
-Description
+A high-performance news article scraper powered by AI that can fetch and analyze articles from major news sources. It uses Crawl4AI and DeepSeek for intelligent crawling and content analysis, combined with async HTTP requests for optimal performance.
 
-This project demonstrates the integration of web scraping, DynamoDB setup (using Docker), and data processing using Python. The repository includes scripts for scraping news articles from various websites, storing the scraped data in a local DynamoDB instance, and using Docker to containerize the setup.
+## Features
 
-Repository Contents
+### Core Features
+- AI-powered content extraction and analysis using DeepSeek
+- Intelligent crawling with Crawl4AI integration
+- Asynchronous scraping for high performance
+- Smart duplicate detection and removal
+- Comprehensive error handling and logging
+- Progress tracking with tqdm
 
-1. docker-compose.yml
+### Supported News Sources
+Includes major news outlets such as:
+- Yahoo News
+- NBC News
+- CNN
+- Forbes
+- New York Times
+- Reuters
+- Fox News
+- NPR
+- Bloomberg
+- And many more!
 
-This file defines the Docker setup for a local DynamoDB instance.
+## Setup
 
-Service Name: dbDYNAMODB
+You can run this project either directly with Python or using Docker.
 
-Image: amazon/dynamodb-local
+### Option 1: Direct Python Setup
 
-Ports: Exposes the local DynamoDB on port 8000.
-
-Volume Mapping: Maps the local folder dynamodb-data to /data inside the container to persist data.
-
-Command:
-
-To start the DynamoDB container:
-
-docker-compose up
-
-To stop the container:
-
-docker-compose down
-
-2. scrapping_articles.py
-
-This script scrapes articles from news websites, categorizes them, and saves the data to a CSV file (news_articles.csv).
-
-Libraries Used: requests, BeautifulSoup, csv
-
-News Categories:
-
-Sports
-
-Politics
-
-Weather
-
-Finance
-
-Music
-
-Key Functionality:
-
-Scrapes up to 10 articles per website.
-
-Handles relative URLs and missing data gracefully.
-
-Outputs a CSV file with the following columns:
-
-description: Title of the article.
-
-url: Link to the article.
-
-category: Article category.
-
-3. test.py
-
-This script interacts with the DynamoDB instance to create a table, populate it with the scraped data from news_articles.csv, and scan the table to retrieve all stored items.
-
-Key Steps:
-
-Create a DynamoDB Table:
-
-Table Name: NewsArticles
-
-Primary Key: url (String type).
-
-Insert Data:
-
-Reads news_articles.csv using pandas and inserts each row as an item into the DynamoDB table.
-
-Scan the Table:
-
-Retrieves and prints all items stored in the table.
-
-Commands to Run:
-
-python test.py
-
-Requirements
-
-All required Python libraries are listed in requirements.txt.
-
-To Install:
-
+1. Install the required dependencies:
+```bash
 pip install -r requirements.txt
+```
 
-Libraries:
+2. Set up your environment variables:
+```bash
+cp .env.example .env  # Create from example if available
+```
+Add your API keys and configuration to the `.env` file.
 
-boto3: For interacting with DynamoDB.
+### Option 2: Docker Setup
 
-pandas: For data manipulation.
+1. Make sure you have Docker and Docker Compose installed
 
-requests: For making HTTP requests.
+2. Set up your environment variables:
+```bash
+cp .env.example .env  # Create from example if available
+```
 
-BeautifulSoup: For parsing HTML content.
+3. Build and run with Docker Compose:
+```bash
+docker-compose up --build
+```
 
-Running the Project
+The scraper will run in a container with proper volume mapping for output and logs.
 
-Set Up DynamoDB (Docker):
+## Usage
 
-Ensure Docker is installed and running.
+### Basic Usage
+```bash
+python crawl_4_ai.py
+```
 
-Run:
+### What it Does
+1. Crawls configured news sources using AI-powered extraction
+2. Analyzes and categorizes articles using DeepSeek
+3. Removes duplicate content
+4. Saves processed articles to CSV format
 
-docker-compose up
+### Project Structure
+- `crawl_4_ai.py`: Main crawler implementation
+- `config.py`: News sources and selector configurations
+- `models/`: Data models and schemas
+- `utils/`: Helper functions and utilities
 
-Scrape Articles:
+## Output Format
 
-Run scrapping_articles.py to scrape articles and generate the CSV:
+The script generates a CSV file with comprehensive article data:
 
-python scrapping_articles.py
+### Article Data
+- Title and description
+- Source URL
+- Publication date
+- Category
+- Content analysis
+- Timestamp of extraction
 
-Insert Data into DynamoDB:
+## Dependencies
 
-Run test.py to create the table, populate it, and retrieve data:
+Key dependencies include:
+- `crawl4ai`: AI-powered web crawling
+- `beautifulsoup4`: HTML parsing
+- `python-dotenv`: Environment management
+- `tqdm`: Progress tracking
+- Additional requirements in `requirements.txt`
 
-python test.py
+## Error Handling
 
-View Data:
+- Robust error handling with detailed logging
+- Automatic retry mechanism with exponential backoff
+- Graceful degradation for failed sources
+- Proxy support to avoid rate limiting
 
-Use the scan operation in test.py to view all stored articles.
+## Contributing
 
-Additional Notes
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-Local DynamoDB: This project uses a local instance of DynamoDB for development and testing purposes.
+## License
 
-Error Handling: Scripts include error handling for common issues such as HTTP request failures and DynamoDB table conflicts.
+MIT License - feel free to use and modify as needed.
 
-CSV File: Ensure that news_articles.csv exists in the working directory before running test.py.
+## Customization
 
-Future Improvements
-
-Add support for paginated scraping to handle more articles per website.
-
-Implement AWS-hosted DynamoDB for production use.
-
-Add testing scripts to validate scraping and data insertion processes.
+You can modify the `sources` dictionary in the `NewsArticleScraper` class to add or remove news sources for each category.

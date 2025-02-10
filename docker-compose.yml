@@ -1,18 +1,22 @@
 version: '3.8'
-services:
-  dynamodb-local:
-    image: amazon/dynamodb-local:latest
-    container_name: dynamodb-local
-    ports:
-      - "8000:8000"
-    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath ./data"
-    volumes:
-      - "./dynamodb-data:/home/dynamodblocal/data"
-    working_dir: /home/dynamodblocal
 
-  python-app:
+services:
+  scraper:
     build: .
-    container_name: python-app
-    ports:
-      - "5000:5000"
-  
+    volumes:
+      - ./output:/app/output
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+    environment:
+      - TZ=America/New_York
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0 if open('/app/logs/scraper.log', 'a').close() is None else 1)"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

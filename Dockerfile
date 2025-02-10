@@ -1,15 +1,36 @@
-# Use the official Python base image
-FROM python:3.12
+# Use Python 3.11 slim image as base
+FROM python:3.11-slim
 
-# Set the working directory
+# Set working directory
 WORKDIR /app
 
-# Copy application code into the container
-COPY . /app
-# Upgrade pip to the latest version
-RUN python -m pip install --upgrade pip
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
+
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Set the entry point to your application
-CMD ["python", "test.py"]
+# Copy project files
+COPY . .
+
+# Create directories for output and logs
+RUN mkdir -p output logs
+
+# Create a non-root user
+RUN useradd -m -r crawler && \
+    chown -R crawler:crawler /app
+USER crawler
+
+# Command to run the scraper
+CMD ["python", "crawl_4_ai.py"]
