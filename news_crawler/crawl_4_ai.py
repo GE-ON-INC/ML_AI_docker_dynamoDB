@@ -2,11 +2,13 @@ import json
 import os
 import re
 import csv
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from urllib.parse import urlparse
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
+from loguru import logger
 
 from crawl4ai import (
     AsyncWebCrawler,
@@ -18,9 +20,18 @@ from crawl4ai import (
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from config import ARTICLE_SELECTORS
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+parent_dir = str(Path(__file__).parent.parent)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+
+from new_crawler.config import ARTICLE_SELECTORS
 from models.article import Article, ArticleAnalysis
-from utils import parse_date
+from utils.date_utils import parse_date
+from utils.persistent_cache import PersistentArticleCache
 
 # Load environment variables
 load_dotenv()
@@ -28,11 +39,17 @@ load_dotenv()
 class NewsCrawler:
     """AI-powered news crawler using DeepSeek and Crawl4AI."""
     
-    def __init__(self):
+    def __init__(self, storage=None, cache_path: str = "cache/article_cache.db"):
         self.browser_config = self._get_browser_config()
+        self.crawler = None
+        self.cache = PersistentArticleCache(cache_path)  # Initialize persistent cache
+        self.storage = storage  # ArticleStorage instance for immediate saving
+        
+    async def initialize(self):
+        """Initialize the crawler with browser."""
+        # Initialize the crawler with browser
         self.crawler = AsyncWebCrawler(browser_config=self.browser_config)
-        self.visited_urls = set()
-        self.csv_file = None  # Will be set in crawl_multiple if not provided
+        await self.crawler.start()
         
     def _get_browser_config(self) -> BrowserConfig:
         """Get browser configuration for the crawler."""
@@ -41,14 +58,16 @@ class NewsCrawler:
             headless=True,
             verbose=True,
             text_mode=True,  # Only load text content
-            ignore_https_errors=True  # Handle SSL issues
+            ignore_https_errors=True,  # Handle SSL issues
+            use_managed_browser=True  # Use the managed browser
         )
         
     def _get_llm_strategy(self) -> LLMExtractionStrategy:
         """Get LLM extraction strategy configuration."""
         return LLMExtractionStrategy(
-            provider="groq/deepseek-r1-distill-llama-70b",
-            api_token=os.getenv("GROQ_API_KEY"),
+            provider="google",
+            api_token=os.getenv("GOOGLE_API_KEY"),
+            model="gemini-pro",
             schema=Article.model_json_schema(),
             extraction_type="schema",
             instruction=(
@@ -75,13 +94,139 @@ class NewsCrawler:
         if result.success:
             return "No Results Found" in result.cleaned_html
         return False
-        
+                
+    async def _crawl_source_with_semaphore(self, semaphore: asyncio.Semaphore, base_url: str, category: str, max_articles: int, max_pages: int) -> List[Article]:
+        """Crawl a single source with semaphore control for concurrency."""
+        async with semaphore:
+            try:
+                # First get the homepage
+                result = await self.crawler.arun(
+                    url=base_url,
+                    bypass_cache=True,
+                    verbose=True
+                )
+                
+                if not result.success:
+                    logger.error(f"Failed to crawl {base_url}: {result.error_message}")
+                    return []
+                
+                # Extract article links
+                article_links = self._extract_article_links(result.html, base_url)
+                if not article_links:
+                    logger.info(f"No article links found on {base_url}")
+                    return []
+                
+                # Get pagination links
+                soup = BeautifulSoup(result.html, 'html.parser')
+                pagination_links = self._get_pagination_links(soup, base_url)
+                logger.info(f"Found {len(pagination_links)} pagination links")
+                
+                # Crawl all pagination links
+                pages_crawled = 1
+                for page_url in pagination_links:  # Process all pagination links
+                    try:
+                        logger.info(f"Crawling page: {page_url}")
+                        page_result = await self.crawler.arun(
+                            url=page_url,
+                            bypass_cache=True,
+                            verbose=True
+                        )
+                        
+                        if page_result.success:
+                            page_articles = self._extract_article_links(page_result.html, base_url)
+                            article_links.extend(page_articles)
+                            logger.info(f"Found {len(page_articles)} articles on page {pages_crawled + 1}")
+                            pages_crawled += 1
+                            
+                            # Add delay to avoid rate limiting
+                            await asyncio.sleep(2)
+                            
+                    except Exception as e:
+                        logger.error(f"Error crawling page {page_url}: {str(e)}")
+                        continue
+                
+                # Initialize articles list
+                articles = []
+                
+                # Process articles immediately as we find them
+                for article_data in article_links:  # Process all articles
+                    try:
+                        article_url = article_data['url']
+                        
+                        # Check cache
+                        if not self.cache.should_scrape_url(article_url):
+                            logger.debug(f"Skipping cached article: {article_url}")
+                            continue
+                        
+                        # Create basic article with available metadata
+                        article = Article(
+                            url=article_url,
+                            title=article_data.get('title', 'Unknown Title'),
+                            author=article_data.get('author'),
+                            date=None,  # We'll parse this later
+                            content='',  # Will be populated after crawl
+                            category=category,
+                            source=urlparse(base_url).netloc,
+                            excerpt=article_data.get('excerpt')
+                        )
+                        
+                        # Immediately save the article with basic metadata
+                        if self.storage:
+                            self.storage.append_articles([article])
+                            logger.info(f"Added article to storage: {article.title}")
+                        
+                        # Crawl article content asynchronously
+                        article_result = await self.crawler.arun(
+                            url=article_url,
+                            bypass_cache=True,
+                            verbose=True
+                        )
+                        
+                        if article_result.success and article_result.markdown:
+                            # Update article with full content
+                            article.content = article_result.markdown
+                            article.title = article_data.get('title') or article_result.metadata.get('title', article.title)
+                            article.author = article_data.get('author') or article_result.metadata.get('author', article.author)
+                            
+                            # Clean content
+                            article.clean_content()
+                            
+                            # Skip if content is too short
+                            if not article.content or len(article.content) < 100:
+                                logger.debug(f"Skipping article (too short): {article.title}")
+                                continue
+                            
+                            # Update the article in storage with full content
+                            if self.storage:
+                                self.storage.append_articles([article])
+                                logger.info(f"Updated article with content: {article.title}")
+                            
+                            # Add delay to avoid rate limiting
+                            await asyncio.sleep(1)
+                            
+                    except Exception as e:
+                        logger.error(f"Error crawling article {article_url}: {str(e)}")
+                        continue
+                
+                return articles
+                
+            except Exception as e:
+                logger.error(f"Error crawling {base_url}: {str(e)}")
+                return []
+
     async def crawl_page(self, url: str, category: str, session_id: str) -> List[Article]:
         """Crawl a single page for articles."""
         articles = []
         
-        # Skip if already visited
-        if url in self.visited_urls:
+        # Get domain and check if we should scrape
+        domain = urlparse(url).netloc
+        if not self.cache.should_scrape_domain(domain, timeout_minutes=60):
+            logger.debug(f"Skipping {domain} - recently crawled")
+            return articles
+            
+        # Check if URL is already cached
+        if not self.cache.should_scrape_url(url):
+            logger.debug(f"Skipping {url} - already in cache")
             return articles
             
         # Check for no results
@@ -113,40 +258,37 @@ class NewsCrawler:
                 return articles
                 
             for data in extracted_data:
-                # Create article
+                title = data.get('title')
+                
+                # Skip if we've seen this title from this domain
+                if not self.cache.should_scrape_url(url, title):
+                    continue
+                    
+                # Create article with minimal metadata
                 article = Article(
-                    title=data.get('title'),
+                    title=title,
                     url=url,
                     category=category,
-                    source=urlparse(url).netloc,
-                    content=data.get('content'),
-                    author=data.get('author'),
-                    publish_date=data.get('publish_date')
+                    source=urlparse(url).netloc
                 )
                 
-                # Add analysis
-                if 'main_topic' in data:
-                    article.analysis = ArticleAnalysis(
-                        main_topic=data['main_topic'],
-                        subtopics=data.get('subtopics', []),
-                        key_points=data.get('key_points', []),
-                        sentiment=data.get('sentiment', 'neutral'),
-                        bias=data.get('bias')
-                    )
+                # Add to cache
+                self.cache.add_article(url, title, category)
+                
+                # Save article immediately if storage is provided
+                if self.storage:
+                    self.storage.append_articles([article])
                     
-                    # Generate summary from key points
-                    if article.analysis.key_points:
-                        article.summary = ' '.join(article.analysis.key_points[:2])
-                        
-                    # Set topics
-                    article.topics = [article.analysis.main_topic] + article.analysis.subtopics
+                articles.append(article)
                     
                 articles.append(article)
                 
         except Exception as e:
             print(f"Error processing content from {url}: {str(e)}")
             
-        self.visited_urls.add(url)
+        # Add successful URLs to cache
+        for article in articles:
+            self.cache.add_url(article.url)
         return articles
         
     async def crawl_source(self, start_url: str, category: str, max_articles: int = 10) -> List[Article]:
@@ -182,7 +324,23 @@ class NewsCrawler:
             'a[href*="/news/archive/"]',
             '.nav-links a',
             '.next',
-            '.load-more'
+            '.load-more',
+            # Add more specific selectors
+            'a[href*="page="]',  # Common query param style
+            'a[href*="offset="]',
+            'a[href*="p="]',
+            '.pagination__next',
+            '.pagination__page',
+            '.pagination-next',
+            '.pagination-item',
+            'a.next',
+            'link[rel="next"]',
+            # Common text-based pagination links
+            'a:contains("Next")',
+            'a:contains("More")',
+            'a:contains("Load More")',
+            'button:contains("Load More")',
+            '.infinite-scroll-component'
         ]
         
         for selector in pagination_selectors:
@@ -244,11 +402,57 @@ class NewsCrawler:
         
         # Common article containers
         article_selectors = [
+            # Basic article containers
             'article',  # Common article tag
             '.post',    # Common post class
             '.story',   # Common story class
             '.entry',   # Common entry class
             '.article', # Common article class
+            
+            # Common news site containers
+            '.news-item',
+            '.feed-item',
+            '.list-item',
+            '.card',
+            '.content-item',
+            '.media',
+            '.item',
+            '.result',
+            
+            # News site specific selectors
+            '.nytimes-article',
+            '.reuters-article',
+            '.wsj-article',
+            '.wapo-article',
+            '.cnn-article',
+            '.fox-article',
+            '.bbc-article',
+            
+            # Article variations
+            '.article-card',
+            '.news-article',
+            '.blog-post',
+            '.feed-entry',
+            '.stream-item',
+            '.grid-item',
+            '.teaser',
+            '.headline',
+            '.story-card',
+            
+            # Attribute-based selectors
+            '[itemtype*="Article"]',
+            '[itemtype*="NewsArticle"]',
+            '[itemtype*="BlogPosting"]',
+            '[role="article"]',
+            '[data-testid*="article"]',
+            '[data-component*="article"]',
+            '[class*="article"]',
+            '[class*="story"]',
+            
+            # Link-based selectors
+            'a[href*="/article/"]',
+            'a[href*="/story/"]',
+            'a[href*="/news/"]'
         ]
         
         # Find all potential article containers
@@ -316,136 +520,43 @@ class NewsCrawler:
                 
         return articles
         
-    async def crawl_multiple(self, urls: Dict[str, List[str]], articles_per_source: int = 500, max_pages: int = 10) -> List[Article]:
-        """Crawl multiple sources and categories."""
+    async def crawl_multiple(self, urls: Dict[str, List[str]], articles_per_source: int = 100, sites_per_category: int = 50, max_pages: int = 20) -> List[Article]:
+        """Crawl multiple sources and categories with improved concurrency."""
         all_articles = []
-        visited_urls = set()
         
-        # Use provided CSV file or create a new one
-        if not self.csv_file:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            self.csv_file = f'articles_{timestamp}.csv'
-            # Create new file with headers
-            with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=['title', 'url', 'author', 'date', 'content', 'category', 'source', 'excerpt'])
-                writer.writeheader()
+        # Increase concurrent requests
+        semaphore = asyncio.Semaphore(10)  # Allow 10 concurrent requests
         
-        async with AsyncWebCrawler(browser_config=self.browser_config) as crawler:
-            for category, source_urls in urls.items():
-                for base_url in source_urls:
-                    try:
-                        print(f"\nCrawling {base_url}...")
-                        
-                        # First get the homepage
-                        result = await crawler.arun(
-                            url=base_url,
-                            bypass_cache=True,
-                            verbose=True
-                        )
-                        
-                        if not result.success:
-                            print(f"Failed to crawl {base_url}: {result.error_message}")
-                            continue
-                            
-                        # Extract article metadata from homepage
-                        article_data_list = self._extract_article_links(result.html, base_url)
-                        print(f"Found {len(article_data_list)} potential articles on homepage")
-                        
-                        # Get pagination links
-                        soup = BeautifulSoup(result.html, 'html.parser')
-                        pagination_links = self._get_pagination_links(soup, base_url)
-                        print(f"Found {len(pagination_links)} pagination links")
-                        
-                        # Crawl pagination links
-                        pages_crawled = 1
-                        for page_url in pagination_links[:max_pages-1]:  # -1 because we already crawled homepage
-                            try:
-                                print(f"Crawling page: {page_url}")
-                                page_result = await crawler.arun(
-                                    url=page_url,
-                                    bypass_cache=True,
-                                    verbose=True
-                                )
-                                
-                                if page_result.success:
-                                    page_articles = self._extract_article_links(page_result.html, base_url)
-                                    article_data_list.extend(page_articles)
-                                    print(f"Found {len(page_articles)} articles on page {pages_crawled + 1}")
-                                    pages_crawled += 1
-                                    
-                                    # Add delay to avoid rate limiting
-                                    await asyncio.sleep(2)
-                                    
-                            except Exception as e:
-                                print(f"Error crawling page {page_url}: {str(e)}")
-                                continue
-                        
-                        # Crawl each article
-                        for article_data in article_data_list[:articles_per_source]:
-                            article_url = article_data['url']
-                            if article_url in visited_urls:
-                                continue
-                                
-                            try:
-                                article_result = await crawler.arun(
-                                    url=article_url,
-                                    bypass_cache=True,
-                                    verbose=True
-                                )
-                                
-                                if article_result.success and article_result.markdown:
-                                    # Create article using both homepage metadata and crawled content
-                                    article = Article(
-                                        url=article_url,
-                                        title=article_data.get('title') or article_result.metadata.get('title', 'Unknown Title'),
-                                        author=article_data.get('author') or article_result.metadata.get('author'),
-                                        date=parse_date(article_data.get('date')) or parse_date(article_result.metadata.get('date')),
-                                        content=article_result.markdown,
-                                        category=category,
-                                        source=urlparse(base_url).netloc,
-                                        excerpt=article_data.get('excerpt')
-                                    )
-                                    
-                                    # Clean content
-                                    article.clean_content()
-                                    
-                                    # Skip if content is too short
-                                    if not article.content or len(article.content) < 100:
-                                        print(f"Skipping article (too short): {article.title}")
-                                        continue
-                                        
-                                    # Analyze with LLM
-                                    article.analysis = await self._analyze_with_llm(article.content)
-                                    
-                                    all_articles.append(article)
-                                    visited_urls.add(article_url)
-                                    
-                                    # Update CSV file with new article
-                                    with open(self.csv_file, 'a', newline='', encoding='utf-8') as f:
-                                        writer = csv.DictWriter(f, fieldnames=['title', 'url', 'author', 'date', 'content', 'category', 'source', 'excerpt'])
-                                        article_dict = {
-                                            'title': article.title,
-                                            'url': str(article.url),
-                                            'author': article.author,
-                                            'date': article.publish_date.isoformat() if article.publish_date else None,
-                                            'content': article.content,
-                                            'category': article.category,
-                                            'source': article.source,
-                                            'excerpt': article.excerpt
-                                        }
-                                        writer.writerow(article_dict)
-                                    
-                                    print(f"Successfully crawled and saved: {article.title} ({len(article.content)} chars)")
-                                    
-                            except Exception as e:
-                                print(f"Error crawling article {article_url}: {str(e)}")
-                                continue
-                                
-                    except Exception as e:
-                        print(f"Error crawling source {base_url}: {str(e)}")
-                        continue
-                    
+        # Initialize browser if needed
+        await self.initialize()
+        
+        # Create tasks for all sources across all categories
+        tasks = []
+        for category, source_urls in urls.items():
+            # Process all sites in the category
+            logger.info(f"Processing {len(source_urls)} sites for category: {category}")
+            
+            for base_url in source_urls:
+                task = asyncio.create_task(self._crawl_source_with_semaphore(
+                    semaphore, base_url, category, articles_per_source, max_pages
+                ))
+                tasks.append(task)
+        
+        # Process tasks as they complete
+        for task in asyncio.as_completed(tasks):
+            try:
+                articles = await task
+                if articles:
+                    # Save articles immediately
+                    if self.storage:
+                        self.storage.append_articles(articles)
+                    all_articles.extend(articles)
+                    logger.info(f"Added {len(articles)} new articles")
+            except Exception as e:
+                logger.error(f"Error crawling source: {str(e)}")
+                
         return all_articles
+                        
     async def _analyze_with_llm(self, content: str) -> ArticleAnalysis:
         """Analyze article content with LLM."""
         try:
