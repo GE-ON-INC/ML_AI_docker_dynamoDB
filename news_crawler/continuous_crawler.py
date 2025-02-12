@@ -1,22 +1,56 @@
 import asyncio
-import logging
+import argparse
+import os
+from loguru import logger
 from datetime import datetime
 from pathlib import Path
 import signal
 import sys
 
 from crawl_4_ai import NewsCrawler
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+parent_dir = str(Path(__file__).parent.parent)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+
+from utils.article_storage import ArticleStorage
+from new_crawler.config import CRAWLER_CONFIG, FILE_CONFIG, NEWS_SOURCES
 
 # Global flag for graceful shutdown
 running = True
 
+# Constants
+SIMPLE_CSV = 'articles_simple_latest.csv'
+
 def setup_logging():
-    """Configure logging to both file and console."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(message)s',
-        handlers=[logging.StreamHandler()]
-    )
+    """Configure logging with loguru."""
+    # Create output directory if it doesn't exist
+    log_dir = Path(FILE_CONFIG['log_dir'])
+    log_dir.mkdir(exist_ok=True)
+    
+    # Generate log filenames with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f'crawler_{timestamp}.log'
+    error_file = log_dir / f'crawler_{timestamp}.error.log'
+    
+    # Remove default handler
+    logger.remove()
+    
+    # Add handlers for different log levels and destinations
+    logger.add(str(log_file),
+               format="{time:YYYY-MM-DD HH:mm:ss} - {level} - {message}",
+               level="INFO")
+    
+    logger.add(str(error_file),
+               format="{time:YYYY-MM-DD HH:mm:ss} - {level} - {message}",
+               level="ERROR")
+    
+    logger.add(sys.stderr,
+               format="{message}",
+               level="INFO")
 
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
@@ -24,108 +58,110 @@ def signal_handler(signum, frame):
     print("\nShutting down gracefully... Please wait for current crawls to complete.")
     running = False
 
-async def continuous_crawl(csv_file: str):
-    """Continuously crawl news sources with pagination support."""
-    news_sources = {
-        'sports': [
-            'https://www.espn.com',
-            'https://sports.yahoo.com',
-            'https://www.cbssports.com',
-            'https://www.nba.com/news',
-            'https://www.mlb.com/news',
-            'https://www.nfl.com/news',
-            'https://www.skysports.com',
-            'https://www.goal.com',
-            'https://www.foxsports.com',
-            'https://www.nbcsports.com',
-            'https://www.sportingnews.com',
-            'https://www.si.com',
-            'https://bleacherreport.com',
-            'https://www.theathletic.com'
-        ],
-        'business': [
-            'https://www.bloomberg.com',
-            'https://www.reuters.com/business',
-            'https://www.cnbc.com',
-            'https://www.wsj.com',
-            'https://www.ft.com',
-            'https://www.marketwatch.com',
-            'https://www.forbes.com',
-            'https://www.businessinsider.com',
-            'https://www.economist.com',
-            'https://finance.yahoo.com',
-            'https://www.barrons.com',
-            'https://www.investing.com',
-            'https://seekingalpha.com',
-            'https://www.fool.com'
-        ],
-        'technology': [
-            'https://techcrunch.com',
-            'https://www.theverge.com',
-            'https://www.wired.com',
-            'https://arstechnica.com',
-            'https://www.engadget.com'
-        ],
-        'science': [
-            'https://www.sciencemag.org',
-            'https://www.nature.com/news',
-            'https://www.newscientist.com',
-            'https://phys.org',
-            'https://www.scientificamerican.com'
-        ],
-        'world': [
-            'https://www.bbc.com/news/world',
-            'https://www.aljazeera.com',
-            'https://www.dw.com/en/world',
-            'https://www.france24.com/en',
-            'https://www.reuters.com/world'
-        ]
-    }
+async def run_simple_crawl():
+    """Run a simple crawl collecting only title, url, and category."""
+    start_time = datetime.now()
+    storage = ArticleStorage(base_dir='/Users/jeremylevit/Library/Mobile Documents/com~apple~CloudDocs/ge-on news scraper/new_crawler')
+    crawler = NewsCrawler(storage=storage)
     
-    crawler = NewsCrawler()
-    crawler.csv_file = csv_file
+    logger.info(f"Starting simple crawl at {start_time}")
+    logger.info(f"Saving articles to: {FILE_CONFIG['csv_file']}")
+    logger.info(f"Sources per category:")
+    for category, sources in NEWS_SOURCES.items():
+        logger.info(f"  {category.title()}: {len(sources)} sources")
     
-    while running:
-        try:
-            logging.info(f"\nStarting new crawl cycle at {datetime.now()}")
-            
-            # Crawl with pagination (up to 10 pages per source, 500 articles per source)
-            articles = await crawler.crawl_multiple(
-                news_sources,
-                articles_per_source=500,
-                max_pages=10
-            )
-            
-            logging.info(f"\nFinished crawl cycle. Found {len(articles)} articles")
-            logging.info("Waiting 30 minutes before next cycle...")
-            
-            # Wait 30 minutes before next cycle, but check running flag every 5 seconds
-            for _ in range(360):  # 360 * 5 seconds = 30 minutes
-                if not running:
-                    break
-                await asyncio.sleep(5)
-                
-        except Exception as e:
-            logging.error(f"Error during crawl cycle: {str(e)}")
-            await asyncio.sleep(60)  # Wait a minute before retrying
+    # Get initial article count
+    initial_count = storage.get_article_count()
+    logger.info(f"Initial article count: {initial_count}")
+    
+    # Crawl all sources at once for faster processing
+    articles = await crawler.crawl_multiple(
+        NEWS_SOURCES,
+        articles_per_source=CRAWLER_CONFIG['articles_per_source'],
+        sites_per_category=CRAWLER_CONFIG['sites_per_category']
+    )
+    
+    end_time = datetime.now()
+    duration = end_time - start_time
+    logger.info(f"\nSimple crawl completed in {duration}.")
+    logger.info(f"Found {len(articles)} articles")
+    logger.info(f"Total articles in storage: {storage.get_article_count()}")
+    
+    return len(articles)
 
-async def main():
-    """Main entry point for continuous crawler."""
-    setup_logging()
+async def run_full_crawl():
+    """Run a full crawl collecting all article data including content and analysis."""
+    start_time = datetime.now()
     
-    # Register signal handlers
+    # Initialize storage for immediate article saving
+    storage = ArticleStorage(base_dir='/Users/jeremylevit/Library/Mobile Documents/com~apple~CloudDocs/ge-on news scraper/new_crawler')
+    crawler = NewsCrawler(storage=storage)
+    
+    logger.info(f"Starting full crawl at {start_time}")
+    logger.info(f"Sources per category:")
+    for category, sources in NEWS_SOURCES.items():
+        logger.info(f"  {category.title()}: {len(sources)} sources")
+    
+    # Crawl with full content extraction
+    articles = await crawler.crawl_multiple(
+        NEWS_SOURCES,
+        articles_per_source=CRAWLER_CONFIG['articles_per_source'],
+        sites_per_category=CRAWLER_CONFIG['sites_per_category'],
+        max_pages=10
+    )
+    
+    end_time = datetime.now()
+    duration = end_time - start_time
+    logger.info(f"Full crawl completed in {duration}. Found {len(articles)} articles.")
+    
+    return articles
+
+async def run_continuous_crawl(interval_minutes: int = None, mode: str = 'simple'):
+    """Run continuous crawls with a specified interval."""
+    global running
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Use existing CSV file
-    csv_file = 'articles_20250209_234732.csv'
+    if interval_minutes is None:
+        interval_minutes = CRAWLER_CONFIG['default_interval_minutes']
     
-    logging.info("Starting continuous crawler...")
-    logging.info("Press Ctrl+C to stop gracefully")
+    logger.info(f"Starting continuous {mode} crawler with {interval_minutes} minute interval")
     
-    await continuous_crawl(csv_file)
+    while running:
+        try:
+            if mode == 'simple':
+                await run_simple_crawl()
+            else:
+                await run_full_crawl()
+                
+            if running:
+                logger.info(f"Waiting {interval_minutes} minutes until next crawl...")
+                await asyncio.sleep(interval_minutes * 60)
+        except Exception as e:
+            logger.error(f"Error during crawl: {str(e)}")
+            if running:
+                await asyncio.sleep(CRAWLER_CONFIG['retry_delay_seconds'])
+
+async def main():
+    """Main entry point with command line argument parsing."""
+    parser = argparse.ArgumentParser(description='News Crawler')
+    parser.add_argument('--mode', choices=['single', 'continuous'], default='single',
+                      help='Crawling mode: single run or continuous')
+    parser.add_argument('--crawl-type', choices=['simple', 'full'], default='simple',
+                      help='Type of crawl: simple (title/url/category) or full (with content)')
+    parser.add_argument('--interval', type=int, default=None,
+                      help='Interval between crawls in continuous mode (minutes)')
+    args = parser.parse_args()
     
-    logging.info("Crawler stopped")
+    setup_logging()
+    
+    if args.mode == 'continuous':
+        await run_continuous_crawl(args.interval, args.crawl_type)
+    else:
+        if args.crawl_type == 'simple':
+            await run_simple_crawl()
+        else:
+            await run_full_crawl()
 
 if __name__ == "__main__":
     asyncio.run(main())
